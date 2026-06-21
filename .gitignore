@@ -1,0 +1,11 @@
+# Real secrets - never commit this
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+*.bin
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
