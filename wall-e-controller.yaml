@@ -1,0 +1,139 @@
+esphome:
+  name: wall-e-controller
+  friendly_name: wall-e-controller
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG # verbose level for diagnosing sensor "ghost" readings
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  id: ha_api
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Wall-E-Controller"
+    password: !secret ap_password
+
+# Time sync for day/night logic
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Asia/Jerusalem"
+
+globals:
+  - id: is_muted
+    type: bool
+    initial_value: 'false'
+  - id: presence_buffer
+    type: int
+    initial_value: '0'
+  - id: absence_buffer
+    type: int
+    initial_value: '0'
+  - id: last_stable_dist
+    type: float
+    initial_value: '0.0'
+  - id: static_count
+    type: int
+    initial_value: '0'
+
+sensor:
+  - platform: ultrasonic
+    trigger_pin: GPIO2
+    echo_pin: GPIO3
+    name: "Wall-E Distance Sensor"
+    id: wall_e_dist
+    update_interval: 0.5s
+    timeout: 2.0m
+    filters:
+      - filter_out: 0.0
+
+interval:
+  - interval: 0.8s
+    then:
+      - lambda: |-
+          auto curr_time = id(sntp_time).now();
+          bool has_val = id(wall_e_dist).has_state();
+          float dist = id(wall_e_dist).state;
+          bool connected = id(ha_api).is_connected();
+          bool time_valid = curr_time.is_valid();
+          bool is_daytime = (curr_time.hour >= 6 && curr_time.hour < 22);
+
+          // 1. Defined operating window (35cm to 1.2m)
+          bool in_zone = (has_val && !std::isnan(dist) && dist < 1.2 && dist > 0.35);
+
+          // 2. Motion detection (change greater than 3cm)
+          bool is_moving = (std::abs(dist - id(last_stable_dist)) > 0.03);
+
+          if (in_zone) {
+            if (!is_moving) {
+              id(static_count)++;
+            } else {
+              id(static_count) = 0;
+              id(last_stable_dist) = dist;
+            }
+
+            // Diagnostic log for "ghost reading" analysis - printed any time something is in range
+            ESP_LOGD("wall_e_diag", "IN-ZONE: Dist=%.2f, Moving=%s, StaticCnt=%d",
+                     dist, is_moving ? "YES" : "NO", id(static_count));
+
+            if (id(static_count) < 6) {
+              id(presence_buffer)++;
+              id(absence_buffer) = 0;
+            } else {
+              id(presence_buffer) = 0;
+              id(absence_buffer)++;
+            }
+          } else {
+            id(presence_buffer) = 0;
+            id(absence_buffer)++;
+            id(static_count) = 0;
+            if (has_val && !std::isnan(dist)) id(last_stable_dist) = dist;
+          }
+
+          // 3. Action logic
+          if (id(presence_buffer) >= 3) {
+            if (time_valid && is_daytime) {
+              if (connected && !id(is_muted)) {
+                ESP_LOGI("wall_e", "ACTION: Muting (Dist: %.2f)", dist);
+                id(is_muted) = true;
+                id(mute_action).execute();
+              }
+            } else {
+              // Log for when detection happens at night or without valid time
+              ESP_LOGD("wall_e", "Bypassed: Hour=%d, TimeValid=%s", curr_time.hour, time_valid ? "YES" : "NO");
+              id(presence_buffer) = 0;
+            }
+          }
+
+          // 4. Volume restore
+          if (id(is_muted) && id(absence_buffer) >= 3) {
+            ESP_LOGI("wall_e", "ACTION: Restoring (Clear)");
+            id(is_muted) = false;
+            id(absence_buffer) = 0;
+            id(restore_action).execute();
+          }
+
+script:
+  - id: mute_action
+    then:
+      - homeassistant.service:
+          service: script.wall_e_volume_mute
+  - id: restore_action
+    then:
+      - homeassistant.service:
+          service: script.wall_e_volume_restore
